@@ -91,6 +91,34 @@ struct Strings {
     var yes: String { localized(zh: "是", en: "Yes") }
     var no: String { localized(zh: "否", en: "No") }
 
+    var pathInputPlaceholder: String { localized(zh: "输入、粘贴或从访达拖拽目录到这里", en: "Type, paste, or drop a folder here") }
+    var pasteFromClipboard: String { localized(zh: "从剪贴板粘贴", en: "Paste from Clipboard") }
+    var clear: String { localized(zh: "清空", en: "Clear") }
+    var quickPresets: String { localized(zh: "常用目录预设", en: "Presets") }
+    var advancedSettings: String { localized(zh: "高级设置与命令预览", en: "Advanced Settings & Preview") }
+    var allChecksPassed: String { localized(zh: "全部检查通过", en: "All Checks Passed") }
+    var checksSummaryPass: String { localized(zh: "环境检查就绪，可以安全迁移", en: "Environment is ready for migration") }
+    var checksSummaryIssue: String { localized(zh: "存在阻断或需留意的检查项", en: "Issues detected, please review") }
+    var showAllChecks: String { localized(zh: "明细", en: "Details") }
+    var clearLogs: String { localized(zh: "清空", en: "Clear") }
+    var copyLogs: String { localized(zh: "复制", en: "Copy") }
+    var targetDiskSpace: String { localized(zh: "目标磁盘空间", en: "Target Disk Space") }
+    var targetFreeSpace: String { localized(zh: "目标剩余", en: "Free Space") }
+    var folderSize: String { localized(zh: "原目录体积", en: "Source Size") }
+    var normalDirectory: String { localized(zh: "普通目录", en: "Normal Folder") }
+    var writable: String { localized(zh: "可写", en: "Writable") }
+    var symlink: String { localized(zh: "软链接", en: "Symlink") }
+    var dragFolderHere: String { localized(zh: "释放鼠标以填入该目录", en: "Drop folder here") }
+    var spaceSufficient: String { localized(zh: "空间充足", en: "Space Sufficient") }
+    var spaceInsufficient: String { localized(zh: "空间不足", en: "Space Insufficient") }
+
+    var awaitingConfiguration: String { localized(zh: "待配置迁移路径", en: "Awaiting Configuration") }
+    var awaitingConfigTip: String { localized(zh: "在左侧选择或输入路径后将自动执行环境预检", en: "Select or enter paths on the left to run pre-migration checks") }
+    var sourceNotSelectedGuide: String { localized(zh: "待选择原目录", en: "Awaiting Source Folder") }
+    var sourceNotSelectedTip: String { localized(zh: "请在左侧选择、粘贴或拖拽要迁移的原目录。", en: "Choose, paste, or drop the source folder to migrate.") }
+    var targetNotSelectedGuide: String { localized(zh: "待选择目标父目录", en: "Awaiting Target Parent Folder") }
+    var targetNotSelectedTip: String { localized(zh: "请在左侧选择外置磁盘或其他目标存储位置。", en: "Choose an external disk or another target parent folder.") }
+
     func localized(zh: String, en: String) -> String {
         switch language {
         case .chinese: zh

@@ -19,11 +19,19 @@ struct DirectorySnapshot {
     let isWritable: Bool
 }
 
+enum OverallCheckState {
+    case awaitingInput
+    case pass
+    case warning
+    case fail
+}
+
 struct CheckResult: Identifiable {
     enum State {
         case pass
         case warning
         case fail
+        case pending
     }
 
     let id = UUID()
@@ -36,6 +44,7 @@ struct CheckResult: Identifiable {
         case .pass: "checkmark.circle.fill"
         case .warning: "exclamationmark.triangle.fill"
         case .fail: "xmark.circle.fill"
+        case .pending: "circle.dotted"
         }
     }
 
@@ -44,6 +53,7 @@ struct CheckResult: Identifiable {
         case .pass: .green
         case .warning: .orange
         case .fail: .red
+        case .pending: .secondary
         }
     }
 }
@@ -79,10 +89,18 @@ struct LogEntry: Identifiable {
     }()
 }
 
+struct PathPreset: Identifiable {
+    let id = UUID()
+    let title: String
+    let path: String
+}
+
 @MainActor
 final class LinkMoverViewModel: ObservableObject {
     @Published var sourceURL: URL?
+    @Published var sourcePathText = ""
     @Published var targetParentURL: URL?
+    @Published var targetParentPathText = ""
     @Published var destinationName = ""
     @Published var prefersAdminPrivileges = true
     @Published var sourceDetails: [String] = []
@@ -92,12 +110,12 @@ final class LinkMoverViewModel: ObservableObject {
     @Published var isBusy = false
     @Published var successSummary: String?
     @Published var activityMessage: String?
+    @Published var sourceSnapshot: DirectorySnapshot?
+    @Published var targetSnapshot: DirectorySnapshot?
 
     private var localization: LocalizationManager
     private let fileManager = FileManager.default
     private let protectedPaths = ["/", "/System", "/System/Library", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/etc", "/private/etc"]
-    private var sourceSnapshot: DirectorySnapshot?
-    private var targetSnapshot: DirectorySnapshot?
     private var rollbackPair: (source: URL, target: URL)?
     private var cancellables = Set<AnyCancellable>()
 
@@ -201,6 +219,155 @@ final class LinkMoverViewModel: ObservableObject {
         return message
     }
 
+    var failCount: Int {
+        checkResults.filter { $0.state == .fail }.count
+    }
+
+    var warningCount: Int {
+        checkResults.filter { $0.state == .warning }.count
+    }
+
+    var hasFailures: Bool {
+        failCount > 0
+    }
+
+    var hasWarnings: Bool {
+        warningCount > 0
+    }
+
+    var passCount: Int {
+        checkResults.filter { $0.state == .pass }.count
+    }
+
+    var isConfigured: Bool {
+        sourceURL != nil && targetParentURL != nil
+    }
+
+    var overallCheckState: OverallCheckState {
+        guard isConfigured else {
+            return .awaitingInput
+        }
+        if hasFailures {
+            return .fail
+        }
+        if hasWarnings {
+            return .warning
+        }
+        return .pass
+    }
+
+    var allChecksPassed: Bool {
+        isConfigured && failCount == 0 && warningCount == 0
+    }
+
+    var isSameVolume: Bool? {
+        guard let sourceURL, let targetParentURL else { return nil }
+        return sourceURL.volumeIdentifierDescription == targetParentURL.volumeIdentifierDescription
+    }
+
+    var sourceSizeFormatted: String? {
+        sourceSnapshot?.sizeInBytes.map { Self.byteFormatterString(from: $0, locale: strings.locale) }
+    }
+
+    var targetFreeSpaceFormatted: String? {
+        targetSnapshot?.availableSpace.map { Self.byteFormatterString(from: $0, locale: strings.locale) }
+    }
+
+    var spaceUsageFraction: Double? {
+        guard let needed = sourceSnapshot?.sizeInBytes,
+              let free = targetSnapshot?.availableSpace,
+              free > 0 else { return nil }
+        return min(max(Double(needed) / Double(free), 0.0), 1.0)
+    }
+
+    var commonPresets: [PathPreset] {
+        [
+            PathPreset(title: "Xcode iOS DeviceSupport", path: "~/Library/Developer/Xcode/iOS DeviceSupport"),
+            PathPreset(title: "Xcode watchOS DeviceSupport", path: "~/Library/Developer/Xcode/watchOS DeviceSupport"),
+            PathPreset(title: "Xcode DerivedData", path: "~/Library/Developer/Xcode/DerivedData"),
+            PathPreset(title: "Xcode Archives", path: "~/Library/Developer/Xcode/Archives"),
+            PathPreset(title: "CocoaPods Cache", path: "~/Library/Caches/CocoaPods"),
+            PathPreset(title: "Android AVD", path: "~/.android/avd")
+        ]
+    }
+
+    static func sanitizePath(_ raw: String) -> String {
+        var path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (path.hasPrefix("\"") && path.hasSuffix("\"")) || (path.hasPrefix("'") && path.hasSuffix("'")) {
+            path = String(path.dropFirst().dropLast())
+        }
+        path = path.replacingOccurrences(of: "\\ ", with: " ")
+        if path.hasPrefix("~") {
+            path = (path as NSString).expandingTildeInPath
+        }
+        if path.count > 1 && path.hasSuffix("/") {
+            path = String(path.dropLast())
+        }
+        return path
+    }
+
+    func updateSourcePath(from text: String) {
+        let cleaned = Self.sanitizePath(text)
+        sourcePathText = cleaned
+        if cleaned.isEmpty {
+            sourceURL = nil
+            destinationName = ""
+            Task { await refreshAll() }
+            return
+        }
+        let url = URL(fileURLWithPath: cleaned).standardizedFileURL
+        sourceURL = url
+        if destinationName.isEmpty || destinationName == url.lastPathComponent {
+            destinationName = url.lastPathComponent
+        }
+        Task { await refreshAll() }
+    }
+
+    func updateTargetParentPath(from text: String) {
+        let cleaned = Self.sanitizePath(text)
+        targetParentPathText = cleaned
+        if cleaned.isEmpty {
+            targetParentURL = nil
+            Task { await refreshAll() }
+            return
+        }
+        let url = URL(fileURLWithPath: cleaned).standardizedFileURL
+        targetParentURL = url
+        Task { await refreshAll() }
+    }
+
+    func pasteFromClipboard(forSource: Bool) {
+        if let string = NSPasteboard.general.string(forType: .string) {
+            if forSource {
+                updateSourcePath(from: string)
+            } else {
+                updateTargetParentPath(from: string)
+            }
+        }
+    }
+
+    func clearPath(forSource: Bool) {
+        if forSource {
+            updateSourcePath(from: "")
+        } else {
+            updateTargetParentPath(from: "")
+        }
+    }
+
+    func applyPreset(_ preset: PathPreset) {
+        updateSourcePath(from: preset.path)
+    }
+
+    func clearLogs() {
+        logs.removeAll()
+    }
+
+    func copyLogs() {
+        let allText = logs.map(\.displayText).joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(allText, forType: .string)
+    }
+
     func selectSourceDirectory() {
         let initialDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Developer", isDirectory: true)
@@ -208,7 +375,9 @@ final class LinkMoverViewModel: ObservableObject {
             title: strings.localized(zh: "选择要迁移的目录", en: "Choose the folder to migrate"),
             initialDirectory: initialDirectory
         ) else { return }
-        sourceURL = url.standardizedFileURL
+        let stdURL = url.standardizedFileURL
+        sourceURL = stdURL
+        sourcePathText = stdURL.path(percentEncoded: false)
         if destinationName.isEmpty {
             destinationName = url.lastPathComponent
         }
@@ -222,7 +391,9 @@ final class LinkMoverViewModel: ObservableObject {
             title: strings.localized(zh: "选择目标父目录", en: "Choose the target parent folder"),
             initialDirectory: targetParentURL
         ) else { return }
-        targetParentURL = url.standardizedFileURL
+        let stdURL = url.standardizedFileURL
+        targetParentURL = stdURL
+        targetParentPathText = stdURL.path(percentEncoded: false)
         Task {
             await refreshAll()
         }
@@ -364,20 +535,24 @@ final class LinkMoverViewModel: ObservableObject {
     private func buildChecks() -> [CheckResult] {
         var results: [CheckResult] = []
 
-        guard let sourceURL else {
-            return [CheckResult(
-                title: strings.localized(zh: "原目录未选择", en: "Source Folder Not Selected"),
-                message: strings.localized(zh: "先选择要迁移的目录。", en: "Choose the folder you want to migrate first."),
-                state: .fail
-            )]
+        if sourceURL == nil {
+            results.append(CheckResult(
+                title: strings.sourceNotSelectedGuide,
+                message: strings.sourceNotSelectedTip,
+                state: .pending
+            ))
         }
 
-        guard let targetParentURL else {
-            return [CheckResult(
-                title: strings.localized(zh: "目标父目录未选择", en: "Target Parent Folder Not Selected"),
-                message: strings.localized(zh: "先选择外置磁盘或其他目标父目录。", en: "Choose an external disk or another target parent folder first."),
-                state: .fail
-            )]
+        if targetParentURL == nil {
+            results.append(CheckResult(
+                title: strings.targetNotSelectedGuide,
+                message: strings.targetNotSelectedTip,
+                state: .pending
+            ))
+        }
+
+        guard let sourceURL, let targetParentURL else {
+            return results
         }
 
         let sourcePath = sourceURL.path(percentEncoded: false)
