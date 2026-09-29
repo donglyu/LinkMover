@@ -317,9 +317,7 @@ final class LinkMoverViewModel: ObservableObject {
         }
         let url = URL(fileURLWithPath: cleaned).standardizedFileURL
         sourceURL = url
-        if destinationName.isEmpty || destinationName == url.lastPathComponent {
-            destinationName = url.lastPathComponent
-        }
+        destinationName = url.lastPathComponent
         Task { await refreshAll() }
     }
 
@@ -378,9 +376,7 @@ final class LinkMoverViewModel: ObservableObject {
         let stdURL = url.standardizedFileURL
         sourceURL = stdURL
         sourcePathText = stdURL.path(percentEncoded: false)
-        if destinationName.isEmpty {
-            destinationName = url.lastPathComponent
-        }
+        destinationName = stdURL.lastPathComponent
         Task {
             await refreshAll()
         }
