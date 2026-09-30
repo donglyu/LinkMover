@@ -95,6 +95,24 @@ struct PathPreset: Identifiable {
     let path: String
 }
 
+struct MigrationRecord: Identifiable, Codable, Equatable {
+    var id: UUID = UUID()
+    var date: Date = Date()
+    var sourcePath: String
+    var targetParentPath: String
+    var destinationPath: String
+    var destinationName: String
+    var sizeInBytes: Int64?
+    var isReverted: Bool = false
+}
+
+enum MigrationRecordStatus {
+    case active
+    case reverted
+    case targetMissing
+    case symlinkBroken
+}
+
 @MainActor
 final class LinkMoverViewModel: ObservableObject {
     @Published var sourceURL: URL?
@@ -112,17 +130,20 @@ final class LinkMoverViewModel: ObservableObject {
     @Published var activityMessage: String?
     @Published var sourceSnapshot: DirectorySnapshot?
     @Published var targetSnapshot: DirectorySnapshot?
+    @Published var history: [MigrationRecord] = []
 
     private var localization: LocalizationManager
     private let fileManager = FileManager.default
     private let protectedPaths = ["/", "/System", "/System/Library", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/etc", "/private/etc"]
     private var rollbackPair: (source: URL, target: URL)?
     private var cancellables = Set<AnyCancellable>()
+    private static let historyStorageKey = "linkmover_migration_history"
 
     init(localization: LocalizationManager) {
         self.localization = localization
         self.sourceDetails = [localization.strings.notSelectedDirectory]
         self.targetDetails = [localization.strings.notSelectedDirectory]
+        loadHistory()
         localization.$language
             .dropFirst()
             .sink { [weak self] _ in
@@ -140,11 +161,11 @@ final class LinkMoverViewModel: ObservableObject {
     }
 
     var sourcePathDisplay: String {
-        sourceURL?.path(percentEncoded: false) ?? strings.notSelectedSourceDirectory
+        sourceURL?.normalizedFilePath ?? strings.notSelectedSourceDirectory
     }
 
     var targetParentPathDisplay: String {
-        targetParentURL?.path(percentEncoded: false) ?? strings.notSelectedTargetParentDirectory
+        targetParentURL?.normalizedFilePath ?? strings.notSelectedTargetParentDirectory
     }
 
     var destinationURL: URL? {
@@ -156,7 +177,7 @@ final class LinkMoverViewModel: ObservableObject {
     }
 
     var destinationPathDisplay: String {
-        destinationURL?.path(percentEncoded: false) ?? strings.destinationPathPlaceholder
+        destinationURL?.normalizedFilePath ?? strings.destinationPathPlaceholder
     }
 
     var previewCommand: String {
@@ -168,8 +189,8 @@ final class LinkMoverViewModel: ObservableObject {
         }
 
         return """
-        mv "\(sourceURL.path(percentEncoded: false))" "\(targetParentURL.path(percentEncoded: false))/"
-        ln -s "\(destinationURL.path(percentEncoded: false))" "\(sourceURL.path(percentEncoded: false))"
+        mv "\(sourceURL.normalizedFilePath)" "\(targetParentURL.normalizedFilePath)/"
+        ln -s "\(destinationURL.normalizedFilePath)" "\(sourceURL.normalizedFilePath)"
         """
     }
 
@@ -375,7 +396,7 @@ final class LinkMoverViewModel: ObservableObject {
         ) else { return }
         let stdURL = url.standardizedFileURL
         sourceURL = stdURL
-        sourcePathText = stdURL.path(percentEncoded: false)
+        sourcePathText = stdURL.normalizedFilePath
         destinationName = stdURL.lastPathComponent
         Task {
             await refreshAll()
@@ -389,7 +410,7 @@ final class LinkMoverViewModel: ObservableObject {
         ) else { return }
         let stdURL = url.standardizedFileURL
         targetParentURL = stdURL
-        targetParentPathText = stdURL.path(percentEncoded: false)
+        targetParentPathText = stdURL.normalizedFilePath
         Task {
             await refreshAll()
         }
@@ -451,9 +472,142 @@ final class LinkMoverViewModel: ObservableObject {
                         en: "Freed up \(Self.byteFormatterString(from: $0, locale: strings.locale))"
                     )
                 } ?? strings.localized(zh: "迁移成功", en: "Migration completed")
+                addHistoryRecord(
+                    sourcePath: sourceURL.normalizedFilePath,
+                    targetParentPath: targetParentURL.normalizedFilePath,
+                    destinationPath: destinationURL.normalizedFilePath,
+                    destinationName: destinationName,
+                    sizeInBytes: releasedBytes
+                )
             }
         } catch {
             appendLog(.error, strings.localized(zh: "迁移失败：\(error.localizedDescription)", en: "Migration failed: \(error.localizedDescription)"))
+        }
+
+        await refreshAll()
+    }
+
+    // MARK: - History Operations
+    private func loadHistory() {
+        guard let data = UserDefaults.standard.data(forKey: Self.historyStorageKey) else { return }
+        do {
+            let decoded = try JSONDecoder().decode([MigrationRecord].self, from: data)
+            self.history = decoded
+        } catch {
+            print("Failed to load migration history: \(error)")
+        }
+    }
+
+    private func saveHistory() {
+        do {
+            let encoded = try JSONEncoder().encode(history)
+            UserDefaults.standard.set(encoded, forKey: Self.historyStorageKey)
+        } catch {
+            print("Failed to save migration history: \(error)")
+        }
+    }
+
+    func addHistoryRecord(
+        sourcePath: String,
+        targetParentPath: String,
+        destinationPath: String,
+        destinationName: String,
+        sizeInBytes: Int64?
+    ) {
+        let record = MigrationRecord(
+            id: UUID(),
+            date: Date(),
+            sourcePath: sourcePath,
+            targetParentPath: targetParentPath,
+            destinationPath: destinationPath,
+            destinationName: destinationName,
+            sizeInBytes: sizeInBytes,
+            isReverted: false
+        )
+        history.removeAll { $0.sourcePath == sourcePath && !$0.isReverted }
+        history.insert(record, at: 0)
+        saveHistory()
+    }
+
+    func applyHistoryRecord(_ record: MigrationRecord) {
+        updateSourcePath(from: record.sourcePath)
+        updateTargetParentPath(from: record.targetParentPath)
+        destinationName = record.destinationName
+    }
+
+    func deleteHistoryRecord(_ record: MigrationRecord) {
+        history.removeAll { $0.id == record.id }
+        saveHistory()
+    }
+
+    func clearAllHistory() {
+        history.removeAll()
+        saveHistory()
+    }
+
+    func recordStatus(for record: MigrationRecord) -> MigrationRecordStatus {
+        if record.isReverted {
+            return .reverted
+        }
+        let fm = FileManager.default
+        let targetExists = fm.fileExists(atPath: record.destinationPath)
+        let sourceURL = URL(fileURLWithPath: record.sourcePath)
+        let isSymlink = (try? sourceURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
+
+        if isSymlink && targetExists {
+            return .active
+        } else if isSymlink && !targetExists {
+            return .targetMissing
+        } else if !isSymlink && targetExists {
+            return .symlinkBroken
+        } else if !isSymlink && !targetExists {
+            if fm.fileExists(atPath: record.sourcePath) {
+                return .reverted
+            }
+            return .targetMissing
+        }
+        return .active
+    }
+
+    func revertMigrationRecord(_ record: MigrationRecord) async {
+        let sourceURL = URL(fileURLWithPath: record.sourcePath).standardizedFileURL
+        let destinationURL = URL(fileURLWithPath: record.destinationPath).standardizedFileURL
+
+        isBusy = true
+        activityMessage = strings.localized(zh: "正在撤销迁移...", en: "Reverting migration...")
+        defer {
+            isBusy = false
+            activityMessage = nil
+        }
+
+        appendLog(.info, strings.localized(zh: "开始撤销迁移：\(record.destinationPath) -> \(record.sourcePath)", en: "Starting revert: \(record.destinationPath) -> \(record.sourcePath)"))
+
+        do {
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: destinationURL.normalizedFilePath) else {
+                throw LinkMoverError.validationFailed(strings.localized(zh: "目标目录不存在或所在磁盘未连接", en: "Target folder does not exist or disk is not connected"))
+            }
+
+            let usesAdmin = willUseAdminPrivileges || !isWritableDirectory(at: sourceURL.deletingLastPathComponent()) || !isWritableDirectory(at: destinationURL)
+
+            let task = Task.detached(priority: .userInitiated) {
+                try Self.removeItemIfNeeded(at: sourceURL, useAdminPrivileges: usesAdmin)
+                try Self.moveItem(from: destinationURL, to: sourceURL, useAdminPrivileges: usesAdmin)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: sourceURL.normalizedFilePath, isDirectory: &isDir), isDir.boolValue else {
+                    throw LinkMoverError.validationFailed("原目录还原后校验失败")
+                }
+            }
+            try await task.value
+
+            if let index = history.firstIndex(where: { $0.id == record.id }) {
+                history[index].isReverted = true
+                saveHistory()
+            }
+
+            appendLog(.success, strings.localized(zh: "已成功撤销迁移，目录已移回：\(record.sourcePath)", en: "Migration reverted successfully. Restored to: \(record.sourcePath)"))
+        } catch {
+            appendLog(.error, strings.localized(zh: "撤销迁移失败：\(error.localizedDescription)", en: "Failed to revert migration: \(error.localizedDescription)"))
         }
 
         await refreshAll()
@@ -515,6 +669,11 @@ final class LinkMoverViewModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    func openInFinder(path: String) {
+        let url = URL(fileURLWithPath: path)
+        openInFinder(url)
+    }
+
     private func pickDirectory(title: String, initialDirectory: URL? = nil) -> URL? {
         let panel = NSOpenPanel()
         panel.title = title
@@ -551,8 +710,8 @@ final class LinkMoverViewModel: ObservableObject {
             return results
         }
 
-        let sourcePath = sourceURL.path(percentEncoded: false)
-        let targetPath = targetParentURL.path(percentEncoded: false)
+        let sourcePath = sourceURL.normalizedFilePath
+        let targetPath = targetParentURL.normalizedFilePath
 
         if protectedPaths.contains(where: { sourcePath == $0 || sourcePath.hasPrefix("\($0)/") && $0 != "/" }) {
             results.append(CheckResult(
@@ -603,7 +762,7 @@ final class LinkMoverViewModel: ObservableObject {
         }
 
         if let destinationURL {
-            if fileManager.fileExists(atPath: destinationURL.path(percentEncoded: false)) {
+            if fileManager.fileExists(atPath: destinationURL.normalizedFilePath) {
                 results.append(CheckResult(title: strings.localized(zh: "目标路径已存在", en: "Destination Path Already Exists"), message: strings.localized(zh: "初版为了安全直接阻止该操作。", en: "This operation is blocked for safety in the current version."), state: .fail))
             } else {
                 results.append(CheckResult(title: strings.localized(zh: "目标路径可用", en: "Destination Path Is Available"), message: strings.localized(zh: "目标完整路径尚未被占用。", en: "The full destination path is not occupied yet."), state: .pass))
@@ -696,7 +855,7 @@ final class LinkMoverViewModel: ObservableObject {
 
         let task = Task.detached(priority: .userInitiated) {
             let fm = FileManager.default
-            let path = url.path(percentEncoded: false)
+            let path = url.normalizedFilePath
             let exists = fm.fileExists(atPath: path)
             let values = try? url.resourceValues(forKeys: [
                 .isDirectoryKey,
@@ -730,17 +889,13 @@ final class LinkMoverViewModel: ObservableObject {
     }
 
     nonisolated private static func createSymlink(at source: URL, destination: URL, useAdminPrivileges: Bool) throws {
-        if FileManager.default.fileExists(atPath: source.path(percentEncoded: false)) || isDanglingSymlink(at: source) {
+        if FileManager.default.fileExists(atPath: source.normalizedFilePath) || isDanglingSymlink(at: source) {
             try removeItemIfNeeded(at: source, useAdminPrivileges: useAdminPrivileges)
         }
-        if useAdminPrivileges {
-            try runShell(
-                "/bin/ln -s \(Self.shellQuoted(destination.path(percentEncoded: false))) \(Self.shellQuoted(source.path(percentEncoded: false)))",
-                useAdminPrivileges: true
-            )
-        } else {
-            try FileManager.default.createSymbolicLink(at: source, withDestinationURL: destination)
-        }
+        try runShell(
+            "/bin/ln -s \(Self.shellQuoted(destination.normalizedFilePath)) \(Self.shellQuoted(source.normalizedFilePath))",
+            useAdminPrivileges: useAdminPrivileges
+        )
     }
 
     nonisolated private static func validateMigration(source: URL, target: URL) throws {
@@ -749,37 +904,29 @@ final class LinkMoverViewModel: ObservableObject {
             throw LinkMoverError.validationFailed("原路径没有变成软链接")
         }
 
-        var resolved = URL(fileURLWithPath: source.path(percentEncoded: false))
+        var resolved = URL(fileURLWithPath: source.normalizedFilePath)
         resolved.resolveSymlinksInPath()
         guard resolved.standardizedFileURL == target.standardizedFileURL else {
             throw LinkMoverError.validationFailed("软链接没有指向预期目标")
         }
 
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: target.path(percentEncoded: false), isDirectory: &isDir), isDir.boolValue else {
+        guard FileManager.default.fileExists(atPath: target.normalizedFilePath, isDirectory: &isDir), isDir.boolValue else {
             throw LinkMoverError.validationFailed("目标目录不存在")
         }
     }
 
     nonisolated private static func moveItem(from source: URL, to destination: URL, useAdminPrivileges: Bool) throws {
-        if useAdminPrivileges {
-            try runShell(
-                "/bin/mv \(Self.shellQuoted(source.path(percentEncoded: false))) \(Self.shellQuoted(destination.path(percentEncoded: false)))",
-                useAdminPrivileges: true
-            )
-        } else {
-            try FileManager.default.moveItem(at: source, to: destination)
-        }
+        try runShell(
+            "/bin/mv \(Self.shellQuoted(source.normalizedFilePath)) \(Self.shellQuoted(destination.normalizedFilePath))",
+            useAdminPrivileges: useAdminPrivileges
+        )
     }
 
     nonisolated private static func removeItemIfNeeded(at url: URL, useAdminPrivileges: Bool) throws {
-        let path = url.path(percentEncoded: false)
+        let path = url.normalizedFilePath
         if FileManager.default.fileExists(atPath: path) || isDanglingSymlink(at: url) {
-            if useAdminPrivileges {
-                try runShell("/bin/rm -rf \(Self.shellQuoted(path))", useAdminPrivileges: true)
-            } else {
-                try FileManager.default.removeItem(at: url)
-            }
+            try runShell("/bin/rm -rf \(Self.shellQuoted(path))", useAdminPrivileges: useAdminPrivileges)
         }
     }
 
@@ -879,14 +1026,14 @@ final class LinkMoverViewModel: ObservableObject {
         useAdminPrivileges: Bool,
         progress: @Sendable (LogEntry.Level, String) async -> Void
     ) async throws -> Bool {
-        await progress(.info, "开始迁移：\(sourceURL.path(percentEncoded: false))")
+        await progress(.info, "开始迁移：\(sourceURL.normalizedFilePath)")
         try moveSource(sourceURL, toParent: targetParentURL, useAdminPrivileges: useAdminPrivileges)
-        await progress(.success, "目录已移动到：\(destinationURL.path(percentEncoded: false))")
+        await progress(.success, "目录已移动到：\(destinationURL.normalizedFilePath)")
 
         do {
             await progress(.info, "正在创建软链接...")
             try createSymlink(at: sourceURL, destination: destinationURL, useAdminPrivileges: useAdminPrivileges)
-            await progress(.success, "软链接创建成功：\(sourceURL.lastPathComponent) -> \(destinationURL.path(percentEncoded: false))")
+            await progress(.success, "软链接创建成功：\(sourceURL.lastPathComponent) -> \(destinationURL.normalizedFilePath)")
 
             await progress(.info, "正在校验结果...")
             try validateMigration(source: sourceURL, target: destinationURL)
@@ -923,7 +1070,15 @@ private enum LinkMoverError: LocalizedError {
     }
 }
 
-private extension URL {
+extension URL {
+    var normalizedFilePath: String {
+        var str = path(percentEncoded: false)
+        while str.count > 1 && str.hasSuffix("/") {
+            str.removeLast()
+        }
+        return str
+    }
+
     var volumeIdentifierDescription: String? {
         guard let identifier = try? resourceValues(forKeys: [.volumeIdentifierKey]).volumeIdentifier else {
             return nil

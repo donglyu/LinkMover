@@ -36,6 +36,7 @@ struct ContentView: View {
     @State private var isShowingConfirmation = false
     @State private var isShowingAdvancedSettings = false
     @State private var isShowingCheckDetails = false
+    @State private var isShowingHistory = false
     @State private var isSourceDropTargeted = false
     @State private var isTargetDropTargeted = false
 
@@ -99,6 +100,9 @@ struct ContentView: View {
         } message: {
             Text(viewModel.confirmationMessage)
         }
+        .sheet(isPresented: $isShowingHistory) {
+            HistorySheetView(viewModel: viewModel, strings: strings)
+        }
         .task {
             await viewModel.refreshAll()
         }
@@ -129,6 +133,27 @@ struct ContentView: View {
             }
 
             Spacer()
+
+            Button {
+                isShowingHistory = true
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "clock.arrow.circlepath")
+                    Text(strings.history)
+                    if !viewModel.history.isEmpty {
+                        Text("\(viewModel.history.count)")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.18))
+                            .foregroundStyle(Color.accentColor)
+                            .clipShape(Capsule())
+                    }
+                }
+                .font(.subheadline)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
 
             Picker(strings.languageLabel, selection: Binding(
                 get: { localization.language },
@@ -727,13 +752,265 @@ struct ContentView: View {
                 }
                 if let targetURL = targetURL {
                     DispatchQueue.main.async {
-                        update(targetURL.path(percentEncoded: false))
+                        update(targetURL.normalizedFilePath)
                     }
                 }
             }
             return true
         }
         return false
+    }
+}
+
+// MARK: - History Sheet View
+struct HistorySheetView: View {
+    @ObservedObject var viewModel: LinkMoverViewModel
+    let strings: Strings
+    @Environment(\.dismiss) private var dismiss
+    @State private var recordToRevert: MigrationRecord?
+    @State private var isShowingRevertAlert = false
+    @State private var isShowingClearAlert = false
+    @State private var copiedPath: String?
+
+    private static let dateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return df
+    }()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack(spacing: 10) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.title3.bold())
+                    .foregroundStyle(Color.accentColor)
+
+                Text(strings.historyTitle)
+                    .font(.headline.weight(.bold))
+
+                if !viewModel.history.isEmpty {
+                    Text("(\(viewModel.history.count))")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if !viewModel.history.isEmpty {
+                    Button(strings.clearHistory) {
+                        isShowingClearAlert = true
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+                    .disabled(viewModel.isBusy)
+                    .padding(.trailing, 8)
+                }
+
+                Button(strings.done) {
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider()
+
+            if viewModel.history.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "tray")
+                        .font(.system(size: 44))
+                        .foregroundStyle(.secondary.opacity(0.5))
+                        .padding(.bottom, 4)
+                    Text(strings.noHistory)
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    Text(strings.noHistoryTip)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 380)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(40)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(viewModel.history) { record in
+                            historyCard(record)
+                        }
+                    }
+                    .padding(18)
+                }
+            }
+        }
+        .frame(minWidth: 680, idealWidth: 720, minHeight: 480, idealHeight: 560)
+        .alert(strings.confirmRevertTitle, isPresented: $isShowingRevertAlert) {
+            Button(strings.cancel, role: .cancel) {}
+            Button(strings.revertMigration, role: .destructive) {
+                if let record = recordToRevert {
+                    Task {
+                        await viewModel.revertMigrationRecord(record)
+                    }
+                }
+            }
+        } message: {
+            if let record = recordToRevert {
+                Text("\(strings.confirmRevertMessage)\n\n\(strings.sourceDirectory): \(record.sourcePath)\n\(strings.targetFullPath): \(record.destinationPath)")
+            } else {
+                Text(strings.confirmRevertMessage)
+            }
+        }
+        .alert(strings.confirmClearHistoryTitle, isPresented: $isShowingClearAlert) {
+            Button(strings.cancel, role: .cancel) {}
+            Button(strings.clearHistory, role: .destructive) {
+                viewModel.clearAllHistory()
+            }
+        } message: {
+            Text(strings.confirmClearHistoryMessage)
+        }
+    }
+
+    private func historyCard(_ record: MigrationRecord) -> some View {
+        let status = viewModel.recordStatus(for: record)
+        return VStack(alignment: .leading, spacing: 10) {
+            // Top Row
+            HStack(spacing: 8) {
+                Image(systemName: "folder.fill")
+                    .foregroundStyle(Color.accentColor)
+
+                Text(record.destinationName)
+                    .font(.headline)
+
+                Text(Self.dateFormatter.string(from: record.date))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                // Status Badge
+                statusBadge(for: status)
+
+                if let size = record.sizeInBytes {
+                    StatusBadge(
+                        icon: "internaldrive",
+                        text: ByteCountFormatter.string(fromByteCount: size, countStyle: .file),
+                        color: .blue
+                    )
+                }
+
+                Button {
+                    viewModel.deleteHistoryRecord(record)
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(strings.deleteRecord)
+            }
+
+            // Path information
+            VStack(alignment: .leading, spacing: 6) {
+                pathRow(label: strings.localized(zh: "原路径", en: "Source"), path: record.sourcePath)
+                pathRow(label: strings.localized(zh: "目标路径", en: "Destination"), path: record.destinationPath)
+            }
+            .padding(8)
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            // Action Buttons
+            HStack(spacing: 10) {
+                Button {
+                    viewModel.applyHistoryRecord(record)
+                    dismiss()
+                } label: {
+                    Label(strings.refillInputs, systemImage: "arrow.up.left.and.arrow.down.right")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help(strings.localized(zh: "将此记录的路径重新填入主界面的原目录与目标目录输入框中", en: "Refill the source and destination paths into the main window input fields"))
+
+                if status != .reverted {
+                    Button {
+                        recordToRevert = record
+                        isShowingRevertAlert = true
+                    } label: {
+                        Label(strings.revertMigration, systemImage: "arrow.uturn.backward")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(viewModel.isBusy)
+                    .help(strings.localized(zh: "将目标目录移回原路径并删除软链接", en: "Move folder back to source path and remove symbolic link"))
+                }
+
+                Spacer()
+            }
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func pathRow(label: String, path: String) -> some View {
+        HStack(spacing: 6) {
+            Text(label + ":")
+                .font(.caption2.bold())
+                .foregroundStyle(.secondary)
+                .frame(width: 54, alignment: .leading)
+
+            Text(path)
+                .font(.system(.caption2, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+
+            Spacer()
+
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(path, forType: .string)
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(strings.copyLogs)
+
+            Button {
+                viewModel.openInFinder(path: path)
+            } label: {
+                Image(systemName: "arrow.up.forward.app")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(strings.revealInFinder)
+        }
+    }
+
+    @ViewBuilder
+    private func statusBadge(for status: MigrationRecordStatus) -> some View {
+        switch status {
+        case .active:
+            StatusBadge(icon: "checkmark.circle.fill", text: strings.statusActive, color: .green)
+        case .reverted:
+            StatusBadge(icon: "arrow.uturn.backward.circle", text: strings.statusReverted, color: .secondary)
+        case .targetMissing:
+            StatusBadge(icon: "externaldrive.badge.xmark", text: strings.statusTargetMissing, color: .orange)
+        case .symlinkBroken:
+            StatusBadge(icon: "exclamationmark.triangle.fill", text: strings.statusSymlinkBroken, color: .red)
+        }
     }
 }
 
